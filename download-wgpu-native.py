@@ -4,6 +4,7 @@ import sys
 import argparse
 import tempfile
 import platform
+import subprocess
 from zipfile import ZipFile
 
 import requests
@@ -101,6 +102,37 @@ def get_arch():
         return "i686"
 
 
+def clone_repo(repo, target, commit=None, branch=None):
+    """
+    Clone a repo into a target location using subprocess.
+    """
+    subprocess.run(['git', 'clone', f'git@github.com:{repo}.git', target])
+    if commit is not None:
+        checkout = commit
+    elif branch is not None:
+        checkout = branch
+    else:
+        return
+    os.chdir(os.path.join(target, repo.split('/')[-1]))
+    subprocess.run(['git', 'checkout', checkout])
+
+
+def patch_toml(file_path, key, value):
+    """
+    """
+    import tomlkit as tl
+    with open(file_path, 'rb') as f:
+        e = tl.load(f)
+
+    current = e
+    for subkey in key.split('.'):
+        current = current[subkey]
+    current.update(value)
+
+    with open(file_path, 'w') as f:
+        tl.dump(e, f)
+
+
 def main(version, os_string, arch, upstream):
     for build in ("release", "debug"):
         filename = f"wgpu-{os_string}-{arch}-{build}.zip"
@@ -145,6 +177,39 @@ def main(version, os_string, arch, upstream):
         write_current_version(version, commit_sha)
 
 
+def build():
+    naga = {"git": "https://github.com/PyryM/naga",
+            "rev": "7fb3ee52e07c6277c1766cb76c4b4f7078331981"}
+    wgpu = {"git": "gfx-rs/wgpu",
+            "branch": "master"}
+
+    with tempfile.TemporaryDirectory() as root:
+
+        clone_repo(repo=wgpu['git'],
+                   branch=wgpu['branch'],
+                   target=root)
+
+        patch_toml(os.path.join(root, 'Cargo.toml'),
+                   key='workspace.dependencies.naga',
+                   value=naga)
+
+        patch_toml(os.path.join(root, 'wgpu-core', 'Cargo.toml'),
+                   key='dependencies.naga',
+                   value=naga)
+
+        patch_toml(os.path.join(root, 'wgpu-hal', 'Cargo.toml'),
+                   key='dependencies.naga',
+                   value=naga)
+
+        patch_toml(os.path.join(root, 'wgpu-hal', 'Cargo.toml'),
+                   key='dev-dependencies.naga',
+                   value=naga)
+
+        subprocess.run(['cargo', 'build', '--release'])
+        from IPython import embed
+        embed()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Download wgpu-native binaries and headers from github releases"
@@ -173,6 +238,16 @@ if __name__ == "__main__":
         help=f"Upstream repository to download release from (default: {upstream})",
         default=upstream,
     )
+
+    parser.add_argument(
+        "--build",
+        help='Build from source using rust.',
+        default=True
+    )
+
     args = parser.parse_args()
 
-    main(args.version, args.os, args.arch, args.upstream)
+    if args.build:
+        build()
+    else:
+        main(args.version, args.os, args.arch, args.upstream)
