@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import shutil
 import argparse
 import tempfile
 import platform
@@ -10,17 +11,20 @@ from zipfile import ZipFile
 import requests
 
 
-# The directory containing non-python resources that are included in packaging
-RESOURCE_DIR = os.path.join("wgpu", "resources")
-# The version installed through this script is tracked in the backend module
-VERSION_FILE = os.path.join("wgpu", "backends", "rs.py")
-
 # Whether to ensure we export \n instead of \r\n
 FORCE_SIMPLE_NEWLINES = False
 if sys.platform.startswith("win"):
     sample = open(os.path.join(RESOURCE_DIR, "codegen_report.md"), "rb").read()
     if sample.count(b"\r\n") == 0:
         FORCE_SIMPLE_NEWLINES = True
+
+# Current working directory.
+CWD = os.path.abspath(os.path.expanduser(os.path.dirname(__file__)))
+
+# The directory containing non-python resources that are included in packaging
+RESOURCE_DIR = os.path.join(CWD, "wgpu", "resources")
+# The version installed through this script is tracked in the backend module
+VERSION_FILE = os.path.join(CWD, "wgpu", "backends", "rs.py")
 
 
 def get_current_version():
@@ -106,14 +110,18 @@ def clone_repo(repo, target, commit=None, branch=None):
     """
     Clone a repo into a target location using subprocess.
     """
-    subprocess.run(['git', 'clone', f'git@github.com:{repo}.git', target])
+    subprocess.run(['git',
+                    'clone',
+                    f'git@github.com:{repo}.git',
+                    target,
+                    '--recurse-submodules'])
     if commit is not None:
         checkout = commit
     elif branch is not None:
         checkout = branch
     else:
         return
-    os.chdir(os.path.join(target, repo.split('/')[-1]))
+    os.chdir(target)
     subprocess.run(['git', 'checkout', checkout])
 
 
@@ -133,7 +141,8 @@ def patch_toml(file_path, key, value):
         tl.dump(e, f)
 
 
-def main(version, os_string, arch, upstream):
+def main(version, os_string, arch, upstream, run_build=False):
+
     for build in ("release", "debug"):
         filename = f"wgpu-{os_string}-{arch}-{build}.zip"
         url = f"https://github.com/{upstream}/releases/download/v{version}/{filename}"
@@ -177,37 +186,76 @@ def main(version, os_string, arch, upstream):
         write_current_version(version, commit_sha)
 
 
-def build():
+def build(os_string='linux'):
     naga = {"git": "https://github.com/PyryM/naga",
             "rev": "7fb3ee52e07c6277c1766cb76c4b4f7078331981"}
     wgpu = {"git": "gfx-rs/wgpu",
             "branch": "master"}
 
+    wgpu_native = {'gfx-rs/wgpu-native/blob/master/Cargo.toml'}
+
     with tempfile.TemporaryDirectory() as root:
 
-        clone_repo(repo=wgpu['git'],
-                   branch=wgpu['branch'],
-                   target=root)
+        path_wgpu = os.path.join(root, 'wgpu')
+        path_nati = os.path.join(root, 'wgpu-native')
 
-        patch_toml(os.path.join(root, 'Cargo.toml'),
+        clone_repo(repo=wgpu['git'],
+                   commit='330d112',
+                   # branch=wgpu['branch'],
+                   target=path_wgpu)
+
+        patch_toml(os.path.join(path_wgpu, 'Cargo.toml'),
                    key='workspace.dependencies.naga',
                    value=naga)
 
-        patch_toml(os.path.join(root, 'wgpu-core', 'Cargo.toml'),
+        patch_toml(os.path.join(path_wgpu, 'wgpu-core', 'Cargo.toml'),
                    key='dependencies.naga',
                    value=naga)
 
-        patch_toml(os.path.join(root, 'wgpu-hal', 'Cargo.toml'),
+        patch_toml(os.path.join(path_wgpu, 'wgpu-hal', 'Cargo.toml'),
                    key='dependencies.naga',
                    value=naga)
 
-        patch_toml(os.path.join(root, 'wgpu-hal', 'Cargo.toml'),
+        patch_toml(os.path.join(path_wgpu, 'wgpu-hal', 'Cargo.toml'),
                    key='dev-dependencies.naga',
                    value=naga)
 
-        subprocess.run(['cargo', 'build', '--release'])
-        from IPython import embed
-        embed()
+        clone_repo(repo='gfx-rs/wgpu-native',
+                   commit='1adb5576cb566432f38b8d8d9891630b94820133',
+                   target=path_nati)
+
+        shutil.copyfile(os.path.join(CWD, 'cargo_native.toml'),
+                        os.path.join(path_nati, 'Cargo.toml'))
+
+        os.chdir(path_nati)
+        subprocess.run(['make', 'package'])
+
+        for build in ("release", "debug"):
+            zip_filename = os.path.join(path_nati, 'dist', f"wgpu--{build}.zip")
+
+            headerfile1 = "webgpu.h"
+            headerfile2 = "wgpu.h"
+            binaryfile = None
+            if os_string == "linux":
+                binaryfile = "libwgpu_native.so"
+            elif os_string == "macos":
+                binaryfile = "libwgpu_native.dylib"
+            elif os_string == "windows":
+                binaryfile = "wgpu_native.dll"
+            else:
+                raise RuntimeError(f"Platform '{os_string}' not supported")
+            root, ext = os.path.splitext(binaryfile)
+            binaryfile_name = root + "-" + build + ext
+            print(f"Extracting {headerfile1} to {RESOURCE_DIR}")
+            extract_file(zip_filename, headerfile1, RESOURCE_DIR)
+            print(f"Extracting {headerfile2} to {RESOURCE_DIR}")
+            extract_file(zip_filename, headerfile2, RESOURCE_DIR)
+            print(f"Extracting {binaryfile} to {RESOURCE_DIR}")
+            extract_file(zip_filename, binaryfile, RESOURCE_DIR)
+            os.replace(
+                os.path.join(RESOURCE_DIR, binaryfile),
+                os.path.join(RESOURCE_DIR, binaryfile_name),
+            )
 
 
 if __name__ == "__main__":
