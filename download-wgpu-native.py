@@ -270,7 +270,7 @@ def build(repos):
             zip_filename = os.path.join(
                 path_native, 'dist', f"wgpu--{build}.zip")
             handle_zip(zip_filename=zip_filename,
-                       os_string=os_string,
+                       os_string=get_os_string(),
                        build=build)
 
 
