@@ -112,7 +112,7 @@ def clone_repo(repo, target, commit=None, branch=None):
     """
     subprocess.run(['git',
                     'clone',
-                    f'git@github.com:{repo}.git',
+                    f"https://github.com/{repo}.git",
                     target,
                     '--recurse-submodules'])
     if commit is not None:
