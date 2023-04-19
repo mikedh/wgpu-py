@@ -20,7 +20,6 @@ if sys.platform.startswith("win"):
 
 # Current working directory.
 CWD = os.path.abspath(os.path.expanduser(os.path.dirname(__file__)))
-
 # The directory containing non-python resources that are included in packaging
 RESOURCE_DIR = os.path.join(CWD, "wgpu", "resources")
 # The version installed through this script is tracked in the backend module
@@ -108,7 +107,19 @@ def get_arch():
 
 def clone_repo(repo, target, commit=None, branch=None):
     """
-    Clone a repo into a target location using subprocess.
+    Clone a repo into a target location using subprocess
+    calling `git`.
+
+    Parameters
+    -----------
+    repo : str
+      Repo name on github in `user/repo` format.
+    target : str
+      Path on local file system to set as the root for the clone.
+    commit : None or str
+      If passed will check out this exact commit
+    branch : None or str
+      If passed will check out the latest from this branch.
     """
     subprocess.run(['git',
                     'clone',
@@ -120,29 +131,75 @@ def clone_repo(repo, target, commit=None, branch=None):
     elif branch is not None:
         checkout = branch
     else:
+        # we don't need to run the git checkout
         return
-    os.chdir(target)
-    subprocess.run(['git', 'checkout', checkout])
+    subprocess.check_call(['git', 'checkout', checkout], cwd=target)
 
 
 def patch_toml(file_path, key, value):
     """
+    Update a key in a TOML file.
     """
     import tomlkit as tl
+
+    # load the toml file
     with open(file_path, 'rb') as f:
         e = tl.load(f)
 
+    # the key is multi-depth
     current = e
     for subkey in key.split('.'):
         current = current[subkey]
+    # update the dict in-place
     current.update(value)
 
+    # now write the toml file back to disc
     with open(file_path, 'w') as f:
         tl.dump(e, f)
 
 
-def main(version, os_string, arch, upstream, run_build=False):
+def handle_zip(zip_filename, build, os_string):
+    """
+    Extract the files needed by `wgpu-py` from a `wgpu-native`
+    release bundle built using `make package`.
 
+    Parameters
+    ------------
+    zip_filename : str
+      Local path to the release file.
+    build : str
+      Either 'release' or 'debug'
+    os_string : str
+      Which OS.
+    """
+    headerfile1 = "webgpu.h"
+    headerfile2 = "wgpu.h"
+    binaryfile = None
+    if os_string == "linux":
+        binaryfile = "libwgpu_native.so"
+    elif os_string == "macos":
+        binaryfile = "libwgpu_native.dylib"
+    elif os_string == "windows":
+        binaryfile = "wgpu_native.dll"
+    else:
+        raise RuntimeError(f"Platform '{os_string}' not supported")
+    root, ext = os.path.splitext(binaryfile)
+    binaryfile_name = root + "-" + build + ext
+
+    print(f"Extracting {headerfile1} to {RESOURCE_DIR}")
+    extract_file(zip_filename, headerfile1, RESOURCE_DIR)
+
+    print(f"Extracting {headerfile2} to {RESOURCE_DIR}")
+    extract_file(zip_filename, headerfile2, RESOURCE_DIR)
+
+    print(f"Extracting {binaryfile} to {RESOURCE_DIR}")
+    extract_file(zip_filename, binaryfile, RESOURCE_DIR)
+    os.replace(
+        os.path.join(RESOURCE_DIR, binaryfile),
+        os.path.join(RESOURCE_DIR, binaryfile_name))
+
+
+def download(version, os_string, arch, upstream):
     for build in ("release", "debug"):
         filename = f"wgpu-{os_string}-{arch}-{build}.zip"
         url = f"https://github.com/{upstream}/releases/download/v{version}/{filename}"
@@ -150,29 +207,8 @@ def main(version, os_string, arch, upstream, run_build=False):
         zip_filename = os.path.join(tmp, filename)
         print(f"Downloading {url} to {zip_filename}")
         download_file(url, zip_filename)
-        headerfile1 = "webgpu.h"
-        headerfile2 = "wgpu.h"
-        binaryfile = None
-        if os_string == "linux":
-            binaryfile = "libwgpu_native.so"
-        elif os_string == "macos":
-            binaryfile = "libwgpu_native.dylib"
-        elif os_string == "windows":
-            binaryfile = "wgpu_native.dll"
-        else:
-            raise RuntimeError(f"Platform '{os_string}' not supported")
-        root, ext = os.path.splitext(binaryfile)
-        binaryfile_name = root + "-" + build + ext
-        print(f"Extracting {headerfile1} to {RESOURCE_DIR}")
-        extract_file(zip_filename, headerfile1, RESOURCE_DIR)
-        print(f"Extracting {headerfile2} to {RESOURCE_DIR}")
-        extract_file(zip_filename, headerfile2, RESOURCE_DIR)
-        print(f"Extracting {binaryfile} to {RESOURCE_DIR}")
-        extract_file(zip_filename, binaryfile, RESOURCE_DIR)
-        os.replace(
-            os.path.join(RESOURCE_DIR, binaryfile),
-            os.path.join(RESOURCE_DIR, binaryfile_name),
-        )
+        handle_zip(zip_filename=zip_filename, build=build, os_string=os_string)
+
     current_version = get_current_version()
     if version != current_version:
         print(f"Version changed, updating {VERSION_FILE}")
@@ -186,76 +222,56 @@ def main(version, os_string, arch, upstream, run_build=False):
         write_current_version(version, commit_sha)
 
 
-def build(os_string='linux'):
-    naga = {"git": "https://github.com/PyryM/naga",
-            "rev": "7fb3ee52e07c6277c1766cb76c4b4f7078331981"}
-    wgpu = {"git": "gfx-rs/wgpu",
-            "branch": "master"}
+def build(repos):
+    """
 
-    wgpu_native = {'gfx-rs/wgpu-native/blob/master/Cargo.toml'}
+    pip install tomlkit
+    sudo apt-get install git cargo libglfw3-dev make clang
+    """
+
+    naga = repos['naga']
+    wgpu = repos['wgpu']
+    native = repos['wgpu-native']
 
     with tempfile.TemporaryDirectory() as root:
 
         path_wgpu = os.path.join(root, 'wgpu')
-        path_nati = os.path.join(root, 'wgpu-native')
+        path_native = os.path.join(root, 'wgpu-native')
 
+        # clone their pin of
         clone_repo(repo=wgpu['git'],
-                   commit='330d112',
-                   # branch=wgpu['branch'],
+                   commit=wgpu['rev'],
                    target=path_wgpu)
+        clone_repo(repo=native['git'],
+                   commit=native['rev'],
+                   target=path_native)
 
-        patch_toml(os.path.join(path_wgpu, 'Cargo.toml'),
-                   key='workspace.dependencies.naga',
-                   value=naga)
+        if naga is not None:
+            patch_toml(os.path.join(path_wgpu, 'Cargo.toml'),
+                       key='workspace.dependencies.naga',
+                       value=naga)
+            patch_toml(os.path.join(path_wgpu, 'wgpu-core', 'Cargo.toml'),
+                       key='dependencies.naga',
+                       value=naga)
+            patch_toml(os.path.join(path_wgpu, 'wgpu-hal', 'Cargo.toml'),
+                       key='dependencies.naga',
+                       value=naga)
+            patch_toml(os.path.join(path_wgpu, 'wgpu-hal', 'Cargo.toml'),
+                       key='dev-dependencies.naga',
+                       value=naga)
 
-        patch_toml(os.path.join(path_wgpu, 'wgpu-core', 'Cargo.toml'),
-                   key='dependencies.naga',
-                   value=naga)
-
-        patch_toml(os.path.join(path_wgpu, 'wgpu-hal', 'Cargo.toml'),
-                   key='dependencies.naga',
-                   value=naga)
-
-        patch_toml(os.path.join(path_wgpu, 'wgpu-hal', 'Cargo.toml'),
-                   key='dev-dependencies.naga',
-                   value=naga)
-
-        clone_repo(repo='gfx-rs/wgpu-native',
-                   commit='1adb5576cb566432f38b8d8d9891630b94820133',
-                   target=path_nati)
-
+        # patch all the references to a local relative `path`
         shutil.copyfile(os.path.join(CWD, 'cargo_native.toml'),
-                        os.path.join(path_nati, 'Cargo.toml'))
+                        os.path.join(path_native, 'Cargo.toml'))
 
-        os.chdir(path_nati)
-        subprocess.run(['make', 'package'])
+        subprocess.check_call(['make', 'package'], cwd=path_native)
 
         for build in ("release", "debug"):
-            zip_filename = os.path.join(path_nati, 'dist', f"wgpu--{build}.zip")
-
-            headerfile1 = "webgpu.h"
-            headerfile2 = "wgpu.h"
-            binaryfile = None
-            if os_string == "linux":
-                binaryfile = "libwgpu_native.so"
-            elif os_string == "macos":
-                binaryfile = "libwgpu_native.dylib"
-            elif os_string == "windows":
-                binaryfile = "wgpu_native.dll"
-            else:
-                raise RuntimeError(f"Platform '{os_string}' not supported")
-            root, ext = os.path.splitext(binaryfile)
-            binaryfile_name = root + "-" + build + ext
-            print(f"Extracting {headerfile1} to {RESOURCE_DIR}")
-            extract_file(zip_filename, headerfile1, RESOURCE_DIR)
-            print(f"Extracting {headerfile2} to {RESOURCE_DIR}")
-            extract_file(zip_filename, headerfile2, RESOURCE_DIR)
-            print(f"Extracting {binaryfile} to {RESOURCE_DIR}")
-            extract_file(zip_filename, binaryfile, RESOURCE_DIR)
-            os.replace(
-                os.path.join(RESOURCE_DIR, binaryfile),
-                os.path.join(RESOURCE_DIR, binaryfile_name),
-            )
+            zip_filename = os.path.join(
+                path_native, 'dist', f"wgpu--{build}.zip")
+            handle_zip(zip_filename=zip_filename,
+                       os_string=os_string,
+                       build=build)
 
 
 if __name__ == "__main__":
@@ -289,13 +305,21 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--build",
-        help='Build from source using rust.',
-        default=True
+        help='Build from source: requires rust.',
+        default=False
     )
 
     args = parser.parse_args()
-
     if args.build:
-        build()
+        # which upstream repos to build with
+        repos = {'naga': {"git": "https://github.com/PyryM/naga",
+                          "rev": "7fb3ee52e07c6277c1766cb76c4b4f7078331981"},
+                 'wgpu-native': {'git': 'gfx-rs/wgpu-native',
+                                 'rev': '1adb5576cb566432f38b8d8d9891630b94820133'},
+                 'wgpu': {"git": "gfx-rs/wgpu",
+                          "rev": '330d112'}}
+        # clone 3 repos and build them locally in a temporary directory
+        build(repos=repos)
     else:
-        main(args.version, args.os, args.arch, args.upstream)
+        # download a release package from github
+        download(args.version, args.os, args.arch, args.upstream)
